@@ -304,8 +304,24 @@ class RingClient:
             # Multi-camera devices: exactly one component per request.
             body["components"] = [{"component_id": str(component_id)}]
         resp = await self._request("POST", f"/v1/devices/{device_id}/media/image/download", json=body, media=True)
+        ctype = (resp.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if ctype not in ("image/jpeg", "image/png"):
+            doc = _safe_json(resp)
+            if isinstance(doc, dict) and isinstance(doc.get("errors"), list) and doc["errors"]:
+                err = doc["errors"][0]
+                if isinstance(err, dict):
+                    raw_status = str(err.get("status", ""))
+                    status = int(raw_status) if raw_status.isdigit() and 400 <= int(raw_status) <= 599 else 502
+                    code = err.get("code") or "MEDIA_ERROR"
+                    detail = err.get("detail") or err.get("title") or "Snapshot unavailable"
+                    raise RingAPIError(status, f"{code}: {detail}", doc)
+            raise RingAPIError(502, f"Ring returned {ctype or 'unknown content'} instead of an image")
+        if ctype == "image/jpeg" and not resp.content.startswith(bytes.fromhex("ffd8ff")):
+            raise RingAPIError(502, "Ring returned invalid JPEG bytes")
+        if ctype == "image/png" and not resp.content.startswith(bytes.fromhex("89504e470d0a1a0a")):
+            raise RingAPIError(502, "Ring returned invalid PNG bytes")
         ts = resp.headers.get("x-media-timestamp")
-        return Media(resp.content, resp.headers.get("content-type"), int(ts) if ts and ts.isdigit() else None)
+        return Media(resp.content, ctype, int(ts) if ts and ts.isdigit() else None)
 
     async def play_chime(self, device_id: str, audio_ref: str) -> None:
         await self._request("POST", f"/v1/devices/{device_id}/media/audio/playback", json={"audio_ref": audio_ref})

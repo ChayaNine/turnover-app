@@ -73,11 +73,11 @@ Severity scale: **High** blocks or silently breaks a production integration · *
 - **Workaround:** Paste a fresh token before each take. Turnover keeps it in memory only.
 - **Suggestion:** Offer a longer-lived sandbox token (for example 8 hours, read-only) for development.
 
-### 8. Snapshot requests from the Playground **[confirm]**
-- **Task:** Fetch a snapshot for an alert.
-- **Steps:** `POST /v1/devices/{id}/media/image/download` with `at_timestamp`, then with `latest_in_range`.
-- **Expected:** A JPEG, or a 303 redirect to one.
-- **Actual:** *(Record what you saw: the status code and error detail. A community SDK reports a 403 "time range not within authorized boundaries" for range requests.)*
-- **Severity:** *(set after testing)*
-- **Workaround:** Turnover tries `at_timestamp`, then a ±90-second `latest_in_range`, then shows the alert without an image.
-- **Suggestion:** Document the time-range limits for snapshots in the Playground and in production.
+### 8. Snapshot requests from the Playground
+- **Task:** Fetch a snapshot from the Ring Developer Playground.
+- **Steps:** Connected Turnover with a Playground access token, discovered one online device, and requested the latest snapshot within 10 minutes.
+- **Expected:** A JPEG or PNG camera image.
+- **Actual:** Turnover received a JSON response containing error status `416` and code `MEDIA_NOT_FOUND`. Its endpoint incorrectly returned HTTP 200 with the JSON body, so the downloaded JPG was invalid (211 bytes).
+- **Severity:** Medium.
+- **Workaround:** Fixed the Ring client to validate image content types and report embedded Ring media errors. Kept clearly labeled demo images for the offline simulation.
+- **Suggestion:** Provide usable sample snapshots in the Playground or clearly document when simulated devices have no media available.
