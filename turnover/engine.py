@@ -453,7 +453,7 @@ class Engine:
         m = bk.moment(prop, self.bookings(prop.id), at)
         rec.state = m.state.value
         rec.disposition = "alerted"
-        open_alert = next((a for a in self.alerts(prop.id, limit=30) if a.kind == "camera_offline" and a.status == "open"), None)
+        open_alert = next((a for a in self.alerts(prop.id, limit=30) if a.kind == "camera_offline" and a.status in ("open", "acted")), None)
         if evt.type == "device_offline":
             # device_offline lags the real loss of connectivity (docs), so say "since about".
             critical = m.state in (State.VACANT, State.TURNOVER) or (
@@ -632,7 +632,7 @@ class Engine:
             "last_stay": stay(m.booking if m.state == State.TURNOVER else None),
             "next_stay": stay(m.next_booking),
             "window": {"start": m.window_start.isoformat(), "end": m.window_end.isoformat()} if m.window_start and m.window_end else None,
-            "camera_offline": any(a.kind == "camera_offline" and a.status == "open" for a in self.alerts(prop.id, limit=30)),
+            "camera_offline": any(a.kind == "camera_offline" and a.status in ("open", "acted") for a in self.alerts(prop.id, limit=30)),
             "state": status,
             "quiet_hours": m.quiet_hours,
             "headline": headline,
