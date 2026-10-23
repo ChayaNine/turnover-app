@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turnover</title>
+<link rel="preload" href="/static/fonts/onest.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <a class="brand" href="#/today" aria-label="Turnover, go to Today">
+      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="1" y="1" width="22" height="22" rx="7" fill="currentColor"/><rect x="8" y="6" width="8" height="12.5" rx="1.4" fill="none" stroke="#fff" stroke-width="1.7"/><circle cx="13.7" cy="12.4" r="1.05" fill="#F2B544"/></svg>
+      Turnover
+    </a>
+    <nav class="nav" aria-label="Main">
+      <a href="#/today" data-route="today"><span class="ico" data-icon="today"></span>Today<span class="nav-dot" id="navDot" hidden></span></a>
+      <a href="#/homes" data-route="homes"><span class="ico" data-icon="homes"></span>Homes</a>
+      <a href="#/activity" data-route="activity"><span class="ico" data-icon="activity"></span>Activity</a>
+      <button type="button" id="connect"><span class="ico" data-icon="link"></span>Ring account<span class="nav-note" id="ringNote"></span></button>
+    </nav>
+
+    <section class="demo" id="demo" aria-labelledby="demoTitle">
+      <div class="demo-head">
+        <h2 id="demoTitle">Demo day</h2>
+        <button type="button" class="link" id="reset">Start over</button>
+      </div>
+      <p class="demo-clock"><strong id="clockTime">--:--</strong><span id="clockDay">Loading</span></p>
+      <button type="button" class="btn primary block" id="play"><span class="ico" data-icon="play"></span><span id="playLabel">Play the day</span></button>
+      <div class="seg" role="group" aria-label="Playback speed">
+        <button type="button" data-speed="0.25">Slow</button>
+        <button type="button" data-speed="0.12" aria-pressed="true">Normal</button>
+        <button type="button" data-speed="0.05">Fast</button>
+      </div>
+      <label class="switch"><input type="checkbox" id="pauseOnAlert" checked><span class="track" aria-hidden="true"></span>Pause when something needs you</label>
+    </section>
+  </aside>
+
+  <main class="main" id="main" tabindex="-1" aria-live="off"></main>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<dialog id="ringDialog" aria-labelledby="ringTitle">
+  <h2 id="ringTitle">Connect your Ring account</h2>
+  <p>Paste an access token from the Ring Developer Playground. It lasts about 30 minutes, and Turnover only keeps it in memory.</p>
+  <label class="field">Access token<textarea id="token" rows="3" placeholder="eyJ…" spellcheck="false"></textarea></label>
+  <p class="err" id="ringErr"></p>
+  <div class="devices" id="devices"></div>
+  <div class="dialog-actions">
+    <button type="button" class="btn" id="closeDialog">Close</button>
+    <button type="button" class="btn primary" id="doConnect">Connect</button>
+  </div>
+</dialog>
+
+<script src="/static/art.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

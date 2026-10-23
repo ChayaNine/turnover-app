@@ -1,0 +1,520 @@
+From a4160b7908693319bb3d588c2974c0197f078011 Mon Sep 17 00:00:00 2001
+From: Turnover <nine925444@gmail.com>
+Date: Tue, 20 Oct 2026 18:11:46 +0800
+Subject: [PATCH] Verify webhooks with Ring's HMAC X-Signature and accept all
+ documented event types
+
+Ring signs webhooks as X-Signature: sha256=<hex HMAC-SHA256 of the raw body>
+using the app's HMAC Signing Key. The handler previously checked a Bearer
+Authorization header, which Ring does not send, and its schema only allowed
+motion_detected, device_added, device_removed and an undocumented
+person_detected, so button_press, device_online/offline, app_integration_*
+and subscription_* deliveries fell through to the generic path.
+
+- verify X-Signature over the raw bytes before parsing (RING_HMAC_KEY),
+  constant-time compare; keep RING_WEBHOOK_SECRET as a deprecated fallback
+- accept every documented v1.1 event type, keep unknown types as strings
+- add sub_type (open vocabulary), component_ids, timestamp_readable,
+  meta.account_id, subscription device relationships
+- device_id only when source_type is devices (app_integration_* carries the
+  account ID in source)
+- /api/webhook/test now signs a v1.1 payload and sends it through the real
+  handler, so verification is exercised locally
+- README and .env.example document RING_HMAC_KEY with an openssl recipe
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Eqje7FBkk9KJg8SkLLHajj
+---
+ .env.example                  |  13 ++++-
+ README.md                     |  26 +++++++--
+ app/api/webhook/route.ts      |  46 +++++++++++----
+ app/api/webhook/test/route.ts | 104 ++++++++++++++++++----------------
+ lib/schemas/webhook.ts        |  44 ++++++++++++--
+ lib/types/webhook.ts          |  29 +++++++++-
+ lib/webhook-signature.ts      |  35 ++++++++++++
+ 7 files changed, 221 insertions(+), 76 deletions(-)
+ create mode 100644 lib/webhook-signature.ts
+
+diff --git a/.env.example b/.env.example
+index 3bc5ae9..5537b31 100644
+--- a/.env.example
++++ b/.env.example
+@@ -21,7 +21,14 @@
+ # NEXT_PUBLIC_RING_DEVICE_NAME=Camera
+ 
+ # =============================================================================
+-# Webhook (optional — for refresh token mode only)
++# Webhook signature verification
+ # =============================================================================
+-# See: https://developer.amazon.com/docs/ring/notifications.html
+-# RING_WEBHOOK_SECRET=your_partner_access_token_here
++# The HMAC Signing Key issued when you created your app in the Ring Developer Portal.
++# Ring signs each webhook as X-Signature: sha256=<hex HMAC-SHA256 of the raw body>.
++# When set, /api/webhook rejects deliveries with a missing or wrong signature (401).
++# See: https://developer.amazon.com/docs/ring/api-documentation.html#notifications
++# RING_HMAC_KEY=your_hmac_signing_key_here
++
++# Deprecated: bearer-token check from earlier versions of this sample. Ring does not send
++# an Authorization header with webhooks; use RING_HMAC_KEY instead.
++# RING_WEBHOOK_SECRET=
+diff --git a/README.md b/README.md
+index 1dbf927..268d30e 100644
+--- a/README.md
++++ b/README.md
+@@ -200,7 +200,8 @@ Do not set both `RING_ACCESS_TOKEN` and `RING_REFRESH_TOKEN` — the app will sh
+ | `RING_CLIENT_SECRET` | OAuth client secret from [app registration](https://developer.amazon.com/docs/ring/app-registration.html) | Yes (only with refresh token) |
+ | `NEXT_PUBLIC_RING_DEVICE_ID` | Device ID (skips auto-discovery) | No |
+ | `NEXT_PUBLIC_RING_DEVICE_NAME` | Display name for the device | No |
+-| `RING_WEBHOOK_SECRET` | Bearer token for [webhook auth](https://developer.amazon.com/docs/ring/notifications.html) | No |
++| `RING_HMAC_KEY` | HMAC Signing Key from the Developer Portal, used to [verify webhook signatures](https://developer.amazon.com/docs/ring/api-documentation.html#notifications) | Recommended |
++| `RING_WEBHOOK_SECRET` | Deprecated bearer-token check; use `RING_HMAC_KEY` | No |
+ 
+ ---
+ 
+@@ -307,14 +308,29 @@ See [docs/video-processors.md](docs/video-processors.md) for the complete guide.
+ 
+ Available in refresh token mode. The dashboard receives webhook events via POST and broadcasts them to connected clients via SSE.
+ 
++### Signature verification
++
++Ring signs every webhook with HMAC-SHA256 over the raw request body, using the **HMAC Signing Key** issued when you created your app, and sends it as `X-Signature: sha256=<hex>`. Set `RING_HMAC_KEY` in `.env.local` and `/api/webhook` verifies the exact bytes it received before parsing, returning `401` on a missing or wrong signature. The logic lives in `lib/webhook-signature.ts`.
++
++Send a signed test event by hand:
++
+ ```bash
+-# Send a test event
++BODY='{"meta":{"version":"1.1","time":"2026-10-20T18:00:00Z","request_id":"test-1"},"data":{"id":"dev_human_1","type":"motion_detected","attributes":{"source":"dev","source_type":"devices","timestamp":1792000000000,"sub_type":"human"}}}'
++SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$RING_HMAC_KEY" -hex | sed 's/^.* //')"
+ curl -X POST http://localhost:3000/api/webhook \
+-  -H "Content-Type: application/json" \
+-  -d '{"event_type": "motion_detected", "device_id": "camera-1"}'
++  -H "Content-Type: application/json" -H "X-Signature: $SIG" -d "$BODY"
++```
++
++Or let the app build and sign one for you, through the real handler:
++
++```bash
++curl -X POST "http://localhost:3000/api/webhook/test?type=motion_detected&sub_type=package_delivery"
++curl -X POST "http://localhost:3000/api/webhook/test?type=button_press"
+ ```
+ 
+-Configure your Ring webhook to POST to `/api/webhook`. Set `RING_WEBHOOK_SECRET` in `.env.local` for authentication.
++The handler accepts every documented event type (`motion_detected`, `button_press`, `device_added`, `device_removed`, `device_online`, `device_offline`, `app_integration_added`, `app_integration_removed`, `subscription_activated`, `subscription_deactivated`) and passes unknown `sub_type` values through, since Ring treats that vocabulary as open-ended.
++
++Configure your Ring webhook to POST to `/api/webhook`.
+ 
+ ---
+ 
+diff --git a/app/api/webhook/route.ts b/app/api/webhook/route.ts
+index 027bd7c..c4872b6 100644
+--- a/app/api/webhook/route.ts
++++ b/app/api/webhook/route.ts
+@@ -1,6 +1,7 @@
+ import { NextRequest, NextResponse } from 'next/server'
+ import { broadcastEvent, eventStore, addClient, removeClient } from '@/lib/sse-broadcast'
+ import { parseRingWebhook } from '@/lib/schemas/webhook'
++import { SIGNATURE_HEADER, verifyRingWebhook } from '@/lib/webhook-signature'
+ 
+ export const dynamic = 'force-dynamic'
+ export const runtime = 'nodejs'
+@@ -8,15 +9,19 @@ export const runtime = 'nodejs'
+ const processedRequests = new Set<string>()
+ const MAX_PROCESSED_IDS = 1000
+ 
++let warnedUnsigned = false
++
+ function normalizeRingEvent(body: any) {
+   const { meta, data } = body
++  // Ring sends epoch milliseconds, as a number or a numeric string
++  const ts = data.attributes.timestamp
++  const ms = typeof ts === 'number' ? ts : /^\d+$/.test(String(ts ?? '')) ? Number(ts) : Date.parse(String(ts ?? ''))
+   return {
+     event_id: data.id,
+     event_type: data.type,
+-    timestamp: typeof data.attributes.timestamp === 'number'
+-      ? new Date(data.attributes.timestamp).toISOString()
+-      : data.attributes.timestamp || meta.time,
+-    device_id: data.attributes.source,
++    timestamp: Number.isFinite(ms) ? new Date(ms).toISOString() : meta.time,
++    // `source` is a device ID only for device events (source_type "devices")
++    device_id: data.attributes.source_type === 'devices' ? data.attributes.source : null,
+     confidence: data.attributes.confidence ?? null,
+     bounding_box: data.attributes.bounding_box ?? null,
+     thumbnail_url: data.attributes.thumbnail_url ?? null,
+@@ -26,6 +31,9 @@ function normalizeRingEvent(body: any) {
+       request_id: meta.request_id,
+       source_type: data.attributes.source_type,
+       device_link: data.relationships?.devices?.links?.self,
++      sub_type: data.attributes.sub_type,
++      component_ids: data.attributes.component_ids,
++      account_id: meta.account_id,
+     },
+     raw: body,
+   }
+@@ -47,14 +55,32 @@ function normalizeGenericEvent(body: any) {
+ 
+ export async function POST(request: NextRequest) {
+   try {
+-    const authHeader = request.headers.get('Authorization')
+-    const expectedToken = process.env.RING_WEBHOOK_SECRET
+-
+-    if (expectedToken && authHeader !== `Bearer ${expectedToken}`) {
+-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++    // Ring signs the raw body with your app's HMAC Signing Key (X-Signature: sha256=<hex>).
++    // Read the bytes and verify them before parsing: re-serialised JSON won't match.
++    const rawBody = Buffer.from(await request.arrayBuffer())
++    const hmacKey = process.env.RING_HMAC_KEY
++    const legacyToken = process.env.RING_WEBHOOK_SECRET
++
++    if (hmacKey) {
++      if (!verifyRingWebhook(rawBody, request.headers.get(SIGNATURE_HEADER), hmacKey)) {
++        return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
++      }
++    } else if (legacyToken) {
++      // Deprecated: Ring authenticates webhooks with X-Signature, not a bearer token.
++      if (request.headers.get('Authorization') !== `Bearer ${legacyToken}`) {
++        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++      }
++    } else if (!warnedUnsigned) {
++      warnedUnsigned = true
++      console.warn('[WEBHOOK] RING_HMAC_KEY is not set: accepting unsigned webhooks (local development only)')
+     }
+ 
+-    const body = await request.json()
++    let body: any
++    try {
++      body = JSON.parse(rawBody.toString('utf8'))
++    } catch {
++      return NextResponse.json({ error: 'Malformed JSON' }, { status: 400 })
++    }
+ 
+     // Idempotency check
+     const requestId = body?.meta?.request_id
+diff --git a/app/api/webhook/test/route.ts b/app/api/webhook/test/route.ts
+index 264631d..6b621c6 100644
+--- a/app/api/webhook/test/route.ts
++++ b/app/api/webhook/test/route.ts
+@@ -1,39 +1,51 @@
+ import { NextRequest, NextResponse } from 'next/server'
+-import { broadcastEvent } from '@/lib/sse-broadcast'
++import { RING_EVENT_TYPES } from '@/lib/schemas/webhook'
++import { SIGNATURE_HEADER, signRingWebhook } from '@/lib/webhook-signature'
+ 
+ /**
+- * Test endpoint to simulate Ring webhook events for local development.
+- * 
++ * Test endpoint that sends a Ring-shaped webhook through the real /api/webhook handler.
++ *
++ * The Developer Playground doesn't deliver webhooks, so this builds a payload in the
++ * documented v1.1 shape, signs it with RING_HMAC_KEY exactly as Ring does
++ * (X-Signature: sha256=<hex> over the raw body), and POSTs it to /api/webhook. Signature
++ * verification, de-duplication and normalization all run unchanged.
++ *
+  * Usage:
+- *   POST /api/webhook/test
+- *   POST /api/webhook/test?type=motion_detected
+- *   POST /api/webhook/test?type=device_added
++ *   POST /api/webhook/test                                   motion_detected, sub_type human
++ *   POST /api/webhook/test?type=motion_detected&sub_type=package_delivery
++ *   POST /api/webhook/test?type=button_press
++ *   POST /api/webhook/test?type=device_offline
+  */
+ export async function POST(request: NextRequest) {
+   const eventType = request.nextUrl.searchParams.get('type') || 'motion_detected'
++  const subType = request.nextUrl.searchParams.get('sub_type') || 'human'
+   const deviceId = process.env.NEXT_PUBLIC_RING_DEVICE_ID || 'test-device-123'
+-  
+-  // Simulate Ring's JSON:API webhook payload
++
++  if (!(RING_EVENT_TYPES as readonly string[]).includes(eventType)) {
++    return NextResponse.json({ error: `Unknown type. Use one of: ${RING_EVENT_TYPES.join(', ')}` }, { status: 400 })
++  }
++
+   const timestamp = Date.now()
+-  const eventId = `evt_${timestamp}_${Math.random().toString(36).slice(2, 8)}`
+-  const requestId = `req_${Math.random().toString(36).slice(2, 10)}`
+-  
++  const segment = eventType === 'motion_detected' ? subType : eventType
+   const ringPayload = {
+     meta: {
+-      version: '1.0',
+-      time: new Date().toISOString(),
+-      request_id: requestId,
++      version: '1.1',
++      time: new Date(timestamp).toISOString(),
++      request_id: crypto.randomUUID(),
+     },
+     data: {
+-      id: eventId,
++      id: `${deviceId}_${segment}_${timestamp}`,
+       type: eventType,
+       attributes: {
+         source: deviceId,
+         source_type: 'devices',
+-        timestamp: timestamp,
+-        // Add simulated confidence for motion events
++        timestamp,
+         ...(eventType === 'motion_detected' && {
+-          confidence: Math.random() * 0.3 + 0.7, // 0.7-1.0
++          sub_type: subType,
++          timestamp_readable: new Date(timestamp).toISOString().replace('T', ' ').slice(0, 19),
++          // Not part of Ring's payload: simulated values that drive this starter's
++          // canvas overlay demo (see app/hooks/useCanvasOverlay.ts).
++          confidence: Math.random() * 0.3 + 0.7,
+           bounding_box: {
+             x: Math.floor(Math.random() * 400) + 100,
+             y: Math.floor(Math.random() * 200) + 50,
+@@ -44,51 +56,43 @@ export async function POST(request: NextRequest) {
+       },
+       relationships: {
+         devices: {
+-          links: {
+-            self: `/v1/devices/${deviceId}`,
+-          },
++          links: { self: `/v1/devices/${deviceId}` },
+         },
+       },
+     },
+   }
+ 
+-  // Normalize and broadcast (same logic as real webhook)
+-  const event = {
+-    event_id: ringPayload.data.id,
+-    event_type: ringPayload.data.type,
+-    timestamp: new Date(ringPayload.data.attributes.timestamp).toISOString(),
+-    device_id: ringPayload.data.attributes.source,
+-    confidence: ringPayload.data.attributes.confidence ?? null,
+-    bounding_box: ringPayload.data.attributes.bounding_box ?? null,
+-    thumbnail_url: null,
+-    metadata: {
+-      ring_version: ringPayload.meta.version,
+-      ring_time: ringPayload.meta.time,
+-      request_id: ringPayload.meta.request_id,
+-      source_type: ringPayload.data.attributes.source_type,
+-      device_link: ringPayload.data.relationships.devices.links.self,
+-      simulated: true,
+-    },
+-    raw: ringPayload,
+-  }
++  const rawBody = JSON.stringify(ringPayload)
++  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
++  const hmacKey = process.env.RING_HMAC_KEY
++  if (hmacKey) headers[SIGNATURE_HEADER] = signRingWebhook(rawBody, hmacKey)
++  else if (process.env.RING_WEBHOOK_SECRET) headers['Authorization'] = `Bearer ${process.env.RING_WEBHOOK_SECRET}`
+ 
+-  broadcastEvent(event)
++  const res = await fetch(new URL('/api/webhook', request.url), { method: 'POST', headers, body: rawBody })
++  const result = await res.json().catch(() => ({}))
+ 
+-  return NextResponse.json({ 
+-    status: 'simulated', 
+-    event_id: event.event_id,
+-    event_type: event.event_type,
+-  })
++  return NextResponse.json(
++    {
++      status: res.ok ? 'delivered' : 'rejected',
++      signed: Boolean(hmacKey),
++      webhook_status: res.status,
++      webhook_response: result,
++      event_type: eventType,
++    },
++    { status: res.ok ? 200 : 502 }
++  )
+ }
+ 
+ // GET - simple info about the test endpoint
+ export async function GET() {
+   return NextResponse.json({
+-    description: 'Test endpoint to simulate Ring webhook events',
++    description: 'Sends a signed, Ring-shaped webhook through /api/webhook',
+     usage: {
+-      motion: 'POST /api/webhook/test?type=motion_detected',
+-      device_added: 'POST /api/webhook/test?type=device_added',
+-      device_removed: 'POST /api/webhook/test?type=device_removed',
++      motion: 'POST /api/webhook/test?type=motion_detected&sub_type=human',
++      package: 'POST /api/webhook/test?type=motion_detected&sub_type=package_delivery',
++      doorbell: 'POST /api/webhook/test?type=button_press',
++      device_offline: 'POST /api/webhook/test?type=device_offline',
+     },
++    types: RING_EVENT_TYPES,
+   })
+ }
+diff --git a/lib/schemas/webhook.ts b/lib/schemas/webhook.ts
+index ab90c34..63eea14 100644
+--- a/lib/schemas/webhook.ts
++++ b/lib/schemas/webhook.ts
+@@ -1,5 +1,29 @@
+ import { z } from 'zod'
+ 
++/**
++ * Event types documented for Ring webhook payload v1.1.
++ * https://developer.amazon.com/docs/ring/api-documentation.html#event-types
++ */
++export const RING_EVENT_TYPES = [
++  'motion_detected',
++  'button_press',
++  'device_added',
++  'device_removed',
++  'device_online',
++  'device_offline',
++  'app_integration_added',
++  'app_integration_removed',
++  'subscription_activated',
++  'subscription_deactivated',
++] as const
++
++/**
++ * motion_detected sub_type values. With Smart Alerts off every motion event carries
++ * `motion`; with it on, `human`, `vehicle`, `package_delivery` or `other_motion`.
++ * Ring may add values, so treat this as open-ended and pass unknown values through.
++ */
++export const RING_MOTION_SUB_TYPES = ['motion', 'human', 'vehicle', 'package_delivery', 'other_motion'] as const
++
+ /** Bounding box schema */
+ export const BoundingBoxSchema = z.object({
+   x: z.number(),
+@@ -13,28 +37,38 @@ export const RingWebhookMetaSchema = z.object({
+   version: z.string(),
+   time: z.string(),
+   request_id: z.string(),
++  account_id: z.string().optional(),
+ })
+ 
+ /** Ring webhook attributes schema */
+ export const RingWebhookAttributesSchema = z.object({
++  // `source` is a device ID for device events, the account ID for app_integration_*
++  // events (source_type "users"), and "subscriptions" for subscription_* events.
+   source: z.string(),
+-  source_type: z.string(),
+-  timestamp: z.union([z.number(), z.string()]),
++  source_type: z.string().optional(),
++  timestamp: z.union([z.number(), z.string()]).optional(),
++  timestamp_readable: z.string().optional(),
++  sub_type: z.string().optional(),
++  // Multi-camera devices (e.g. Ring Elite) report which camera modules saw the motion.
++  component_ids: z.array(z.string()).optional(),
+   confidence: z.number().optional(),
+   bounding_box: BoundingBoxSchema.optional(),
+   thumbnail_url: z.string().optional(),
+-})
++}).passthrough()
+ 
+ /** Ring webhook data schema */
+ export const RingWebhookDataSchema = z.object({
+   id: z.string(),
+-  type: z.enum(['motion_detected', 'device_added', 'device_removed', 'person_detected']),
++  // Documented types are listed in RING_EVENT_TYPES; unknown types are accepted so a new
++  // event type doesn't make the handler reject deliveries.
++  type: z.string(),
+   attributes: RingWebhookAttributesSchema,
+   relationships: z.object({
+     devices: z.object({
+       links: z.object({ self: z.string().optional() }).optional(),
++      data: z.array(z.object({ type: z.string(), id: z.string() })).optional(),
+     }).optional(),
+-  }).optional(),
++  }).passthrough().optional(),
+ })
+ 
+ /** Full Ring webhook payload schema */
+diff --git a/lib/types/webhook.ts b/lib/types/webhook.ts
+index ccf799b..410e070 100644
+--- a/lib/types/webhook.ts
++++ b/lib/types/webhook.ts
+@@ -7,12 +7,19 @@ export interface RingWebhookMeta {
+   version: string
+   time: string
+   request_id: string
++  account_id?: string
+ }
+ 
+ export interface RingWebhookAttributes {
++  /** Device ID for device events; account ID for app_integration_* (source_type "users") */
+   source: string
+-  source_type: string
+-  timestamp: number | string
++  source_type?: string
++  timestamp?: number | string
++  timestamp_readable?: string
++  /** motion_detected only: motion | human | vehicle | package_delivery | other_motion (open-ended) */
++  sub_type?: string
++  /** Multi-camera devices: which camera modules saw the motion */
++  component_ids?: string[]
+   confidence?: number
+   bounding_box?: BoundingBox
+   thumbnail_url?: string
+@@ -23,12 +30,28 @@ export interface RingWebhookRelationships {
+     links?: {
+       self?: string
+     }
++    /** subscription_* events list the devices the subscription covers */
++    data?: { type: string; id: string }[]
+   }
+ }
+ 
++/** Event types documented for webhook payload v1.1 */
++export type RingEventType =
++  | 'motion_detected'
++  | 'button_press'
++  | 'device_added'
++  | 'device_removed'
++  | 'device_online'
++  | 'device_offline'
++  | 'app_integration_added'
++  | 'app_integration_removed'
++  | 'subscription_activated'
++  | 'subscription_deactivated'
++
+ export interface RingWebhookData {
+   id: string
+-  type: 'motion_detected' | 'device_added' | 'device_removed' | 'person_detected'
++  // Unknown types are kept as strings so new event types don't break the handler
++  type: RingEventType | (string & {})
+   attributes: RingWebhookAttributes
+   relationships?: RingWebhookRelationships
+ }
+diff --git a/lib/webhook-signature.ts b/lib/webhook-signature.ts
+new file mode 100644
+index 0000000..bb282b8
+--- /dev/null
++++ b/lib/webhook-signature.ts
+@@ -0,0 +1,35 @@
++import { createHmac, timingSafeEqual } from 'crypto'
++
++/**
++ * Ring webhook signature verification.
++ *
++ * Ring signs every webhook with HMAC-SHA256 over the raw request body, using the
++ * HMAC Signing Key issued when you create your app, and sends the hex digest as
++ * `X-Signature: sha256=<hex>`. See "Webhook Authentication & Verification" in
++ * https://developer.amazon.com/docs/ring/api-documentation.html#notifications
++ *
++ * Verify the exact bytes you received, before parsing: re-serialising the JSON
++ * produces different bytes and the digest will not match.
++ *
++ * The same key is used for account-linking nonces, but nonces are URL-safe
++ * Base64 without padding, while webhook signatures are hex. Don't mix them up.
++ */
++
++export const SIGNATURE_HEADER = 'x-signature'
++
++export function signRingWebhook(rawBody: Buffer | string, signingKey: string): string {
++  return 'sha256=' + createHmac('sha256', signingKey).update(rawBody).digest('hex')
++}
++
++export function verifyRingWebhook(
++  rawBody: Buffer | string,
++  signatureHeader: string | null,
++  signingKey: string | undefined
++): boolean {
++  if (!signatureHeader || !signingKey) return false
++  const received = signatureHeader.trim().toLowerCase().replace(/^sha256=/, '')
++  const expected = createHmac('sha256', signingKey).update(rawBody).digest('hex')
++  const a = Buffer.from(received, 'utf8')
++  const b = Buffer.from(expected, 'utf8')
++  return a.length === b.length && timingSafeEqual(a, b)
++}
+-- 
+2.43.0
+
